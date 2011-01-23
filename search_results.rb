@@ -2,8 +2,7 @@ require 'rubygems'
 require 'net/http'
 require 'uri'
 require 'open-uri'
-require 'hpricot'
-Hpricot.buffer_size = 262144
+require 'nokogiri'
 
 class SearchResults
   
@@ -13,7 +12,7 @@ class SearchResults
     @path = path
     @page_number = 0
     open(@path,"User-Agent" => USER_AGENT) do |s|
-      @casualties,@web_form = init_links(s,@path)
+      @casualties,@web_form,@next_page = init_links(s,@path)
     end
   end
   
@@ -25,17 +24,28 @@ class SearchResults
       all_casualties.uniq!
       new_casualties = (all_casualties.length > initial_length)
       puts "Page #{@page_number+1} - have #{all_casualties.length} casualties"
-      next_page
-    end while (new_casualties)
+      continue = next_page
+    end while (continue)
     all_casualties
   end
   
   def next_page
     url = "http://www.cwgc.org/search/"+@web_form.delete('action')
-    @page_number = @page_number + 1
-    @web_form['__EVENTTARGET'] = "dgCasualties:_ctl19:_ctl#{@page_number}"
-    res = post_form(URI.parse(url), @web_form)
-    @casualties,@web_form = init_links(res.body,@path)
+    if @next_page
+      @page_number = @page_number + 1
+      @web_form['__EVENTTARGET'] = munge_jscript(@next_page)
+      res = post_form(URI.parse(url), @web_form)
+      @casualties,@web_form,@next_page = init_links(res.body,@path)
+      return true
+    else
+      return false
+    end
+  end
+  
+  def munge_jscript(link)
+    link = link.gsub("javascript:__doPostBack('","")
+    link = link.gsub("','')","")
+    link
   end
   
   def post_form(url,params)
@@ -50,13 +60,33 @@ class SearchResults
     @casualties
   end
   
+  def find_event_target(links)
+    # find the lowest numbered continuation link
+    # after the current page...
+    links = result_page_links(links)
+    found_hole = false
+    ["00","01","02","03","04","05","06","07","08","09","10"].each do |e|
+      link = links.select{|s| s=~ Regexp.new(Regexp.escape("$ctl#{e}"))}
+      if link.empty?
+        if found_hole
+          return nil
+        else
+          found_hole = true
+        end
+      elsif found_hole
+        return link.first
+      end  
+    end
+    return nil
+  end
+  
   def form_as_hash(h)
     attributes = {}
-    (h/"form").each do |f| 
-      attributes['action'] = f.attributes['action'] 
+    h.css("form").each do |f| 
+      attributes['action'] = f['action'] 
     end
-    (h/"form input").each do |i|
-      attributes[i.attributes['name']] = i.attributes['value']
+    h.css("form input").each do |i|
+      attributes[i['name']] = i['value']
     end
     attributes
   end
@@ -66,17 +96,18 @@ class SearchResults
   end
   
   def result_page_links(links)
-    links.select {|s| s=~ Regexp.new('^'+Regexp.escape("javascript:__doPostBack('dgCasualties$_ctl19")) }
+    links.select {|s| s=~ Regexp.new('^'+Regexp.escape("javascript:__doPostBack('dgCasualties$ctl19")) }
   end
   
   def init_links(page,path)
      links = []
-     h = Hpricot(page)
-     (h/"a").each do |a|                
-        url = clean_up(a.attributes['href'],path)
+     h = Nokogiri::HTML(page)
+     h.css("a").each do |a|                
+        url = clean_up(a['href'],path)
         links << url unless (url.nil? or links.include? url)
      end
-     [casualty_pages(links),form_as_hash(h)]
+     next_page = find_event_target(links)
+     [casualty_pages(links),form_as_hash(h),next_page]
   end 
   
   def clean_up(url,path)
